@@ -3,7 +3,7 @@ package com.jakubkras.project.repository;
 import com.jakubkras.project.entity.Movie;
 import com.jakubkras.project.entity.QueryResults;
 import org.springframework.data.jpa.repository.JpaRepository;
-import reactor.core.publisher.Flux;
+
 
 import java.util.List;
 import java.util.Optional;

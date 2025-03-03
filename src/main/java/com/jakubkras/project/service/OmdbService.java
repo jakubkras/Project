@@ -4,6 +4,7 @@ import com.jakubkras.project.entity.Movie;
 import com.jakubkras.project.entity.OmdbResponse;
 import com.jakubkras.project.entity.QueryResults;
 import com.jakubkras.project.entity.Rating;
+import com.jakubkras.project.exception.EmptyValueException;
 import com.jakubkras.project.exception.MovieAlreadyExistsException;
 import com.jakubkras.project.exception.MovieNotFoundException;
 import com.jakubkras.project.exception.NoChangesException;
@@ -13,8 +14,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.web.client.RestTemplateBuilder;
 import org.springframework.stereotype.Service;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.client.RestTemplate;
-import org.springframework.web.reactive.function.client.WebClient;
+import org.springframework.web.servlet.NoHandlerFoundException;
 import org.springframework.web.util.UriComponentsBuilder;
 
 import java.net.URI;
@@ -26,9 +28,8 @@ import java.util.*;
 public class OmdbService {
 
 
-    private RestTemplate restTemplate;
+    private final RestTemplate restTemplate;
     private final MovieRepository movieRepository;
-    private final WebClient webClient;
 
     @Value("${omdb.api.key}")
     private String apiKey;
@@ -38,9 +39,8 @@ public class OmdbService {
 
 
     @Autowired
-    public OmdbService(RestTemplateBuilder restTemplateBuilder, WebClient.Builder webClientBuilder, MovieRepository movieRepository, @Value("${omdb.api.url}") String apiUrl) {
+    public OmdbService(RestTemplateBuilder restTemplateBuilder, MovieRepository movieRepository, @Value("${omdb.api.url}") String apiUrl) {
         this.restTemplate = restTemplateBuilder.build();
-        this.webClient = webClientBuilder.baseUrl(apiUrl).build();
         this.movieRepository = movieRepository;
     }
 
@@ -48,7 +48,7 @@ public class OmdbService {
 
         List<Movie> matchingMovies = movieRepository.findByTitleContainingIgnoreCaseAndIsDeletedFalse(title);
 
-        Optional<Movie> deletedMovie = movieRepository.findByTitleContainingIgnoreCaseAndIsDeletedTrue(title);
+        Optional<Movie> deletedMovie = movieRepository.findByTitleIgnoreCaseAndIsDeletedTrue(title);
 
         if (deletedMovie.isPresent()) {
             throw new MovieNotFoundException("Movie: " + title + " is deleted");
@@ -69,7 +69,7 @@ public class OmdbService {
 
     private Movie fetchFromOmdb(String title) {
         try {
-            String encodedTitle = URLEncoder.encode(title, StandardCharsets.UTF_8.toString());
+            String encodedTitle = URLEncoder.encode(title, StandardCharsets.UTF_8);
 
             String url = UriComponentsBuilder.fromHttpUrl(apiUrl)
                     .queryParam("t", encodedTitle)
@@ -78,21 +78,24 @@ public class OmdbService {
 
             Movie movie = restTemplate.getForObject(url, Movie.class);
 
-            return (movie != null && !movie.getTitle().isEmpty() && movie.getTitle() != null ? movie : null);
+            if (movie != null && movie.getTitle() != null && !movie.getTitle().trim().isEmpty()) {
+                return movie;
+            }
+            return null;
         } catch (Exception e) {
             throw new RuntimeException("Title: " + title + " not found", e);
         }
 
     }
 
-
-    //If I search using query and a given movie title is in the database, the movie title from the database will be displayed and the one from omdb will not appear
-
-
     public List<QueryResults> searchMovieByQuery(String query) throws MovieNotFoundException {
         List<QueryResults> finalResults = new ArrayList<>();
 
         List<Movie> dbMovies = movieRepository.findByTitleContainingIgnoreCaseAndIsDeletedFalse(query);
+
+        if (query.isEmpty()){
+            throw new EmptyValueException("Endpoint value cannot be empty");
+        }
 
         for (Movie movie : dbMovies) {
             QueryResults queryResults = new QueryResults();
@@ -147,65 +150,72 @@ public class OmdbService {
     }
 
 
-        @Transactional
-    public void deleteMovieByImdbID(String imdbID) throws MovieNotFoundException {
 
+    @Transactional
+    public Movie deleteMovieByImdbID(String imdbID) throws MovieNotFoundException {
         Optional<Movie> movieInDatabase = movieRepository.findByImdbIDAndIsDeletedFalse(imdbID);
+        Optional<Movie> deletedMovie = movieRepository.findByImdbIDAndIsDeletedTrue(imdbID);
+
+        if (deletedMovie.isPresent()){
+            throw new MovieNotFoundException("Movie with imdbID: " + imdbID + " has been already deleted.");
+        }
 
         if (movieInDatabase.isPresent()) {
-
             Movie movie = movieInDatabase.get();
             movie.setDeleted(true);
             movieRepository.save(movie);
-            return;
+            return movie;
         }
-
-        if (imdbID.startsWith("ttt")){
-            throw new MovieNotFoundException("Movie with imdbID: " + imdbID + " doesn't exist");
-        }
-
 
         String url = UriComponentsBuilder.fromHttpUrl(apiUrl)
                 .queryParam("i", imdbID)
                 .queryParam("apikey", apiKey)
                 .toUriString();
 
-        Movie omdbMovie = restTemplate.getForObject(url, Movie.class);
+        Movie omdbMovie;
+        try {
+            omdbMovie = restTemplate.getForObject(url, Movie.class);
+        } catch (Exception e) {
+            throw new MovieNotFoundException("Error fetching movie from external API: " + e.getMessage());
+        }
 
-        if (omdbMovie != null && !omdbMovie.getImdbID().isEmpty() && omdbMovie.getImdbID() != null) {
-
-            Movie movie = new Movie();
-            movie.setImdbID(omdbMovie.getImdbID());
-            movie.setTitle(omdbMovie.getTitle());
-            movie.setGenre(omdbMovie.getGenre());
-            movie.setPlot(omdbMovie.getPlot());
-            movie.setAwards(omdbMovie.getAwards());
-            movie.setDeleted(true);
-            movie.setUpdated(false);
-            movie.setReleaseYear(omdbMovie.getReleaseYear());
-            movie.setPreviousTitle(null);
-
-            if (omdbMovie.getRatings() != null) {
-                omdbMovie.getRatings().forEach(rating -> rating.setMovie(movie));
-                movie.setRatings(omdbMovie.getRatings());
-            }
-
-            movieRepository.save(movie);
-
-        } else {
+        if (omdbMovie == null || omdbMovie.getImdbID() == null || omdbMovie.getImdbID().isEmpty()) {
             throw new MovieNotFoundException("Movie with this imdbID: " + imdbID + " doesn't exist");
         }
+
+        Movie movie = new Movie();
+        movie.setImdbID(omdbMovie.getImdbID());
+        movie.setTitle(omdbMovie.getTitle());
+        movie.setGenre(omdbMovie.getGenre());
+        movie.setPlot(omdbMovie.getPlot());
+        movie.setAwards(omdbMovie.getAwards());
+        movie.setDeleted(true);
+        movie.setUpdated(false);
+        movie.setReleaseYear(omdbMovie.getReleaseYear());
+        movie.setPreviousTitle(null);
+
+        if (omdbMovie.getRatings() != null) {
+            omdbMovie.getRatings().forEach(rating -> rating.setMovie(movie));
+            movie.setRatings(omdbMovie.getRatings());
+        }
+
+        movieRepository.save(movie);
+        return movie;
     }
 
     @Transactional
-    public void updateMovieByImdbID(String imdbID, Movie updatedMovieData) throws MovieNotFoundException {
+    public Movie updateMovieByImdbID(String imdbID, Movie updatedMovieData) throws MovieNotFoundException {
+
+        if (updatedMovieData.getTitle() == null || updatedMovieData.getTitle().trim().isEmpty()) {
+            throw new EmptyValueException("Title cannot be empty or null");
+        }
 
         Optional<Movie> movieOptional = movieRepository.findByImdbIDAndIsDeletedFalse(imdbID);
         Optional<Movie> deletedMovie = movieRepository.findByImdbIDAndIsDeletedTrue(imdbID);
 
         Movie omdbMovie = null;
 
-        if(movieOptional.isEmpty() && imdbID.startsWith("tt")) {
+        if (movieOptional.isEmpty() && imdbID.matches("^tt\\d{7}$")) {
             String url = UriComponentsBuilder.fromHttpUrl(apiUrl)
                     .queryParam("i", imdbID)
                     .queryParam("apikey", apiKey)
@@ -220,8 +230,7 @@ public class OmdbService {
 
         boolean titleExistInDb = movieRepository.existsByTitleIgnoreCase(updatedMovieData.getTitle());
         boolean existingInDb = movieOptional.map(movie -> movie.getTitle().equalsIgnoreCase(updatedMovieData.getTitle())).orElse(false);
-        boolean titleExistInOmdb = omdbMovie !=null && omdbMovie.getTitle().equalsIgnoreCase(updatedMovieData.getTitle());
-
+        boolean titleExistInOmdb = omdbMovie != null && omdbMovie.getTitle().equalsIgnoreCase(updatedMovieData.getTitle());
 
         if (movieOptional.isPresent() && deletedMovie.isEmpty()) {
 
@@ -231,34 +240,28 @@ public class OmdbService {
                 throw new NoChangesException("No changes detected for movie with imdbID: " + imdbID);
             }
 
-            if (titleExistInDb || existingInDb || titleExistInOmdb ){
-                throw new MovieAlreadyExistsException("Title: "+ updatedMovieData.getTitle() + " already exist");
+            if (titleExistInDb || existingInDb || titleExistInOmdb) {
+                throw new MovieAlreadyExistsException("Title: " + updatedMovieData.getTitle() + " already exists");
             }
 
             if (updatedMovieData.getPreviousTitle() == null)
                 movie.setPreviousTitle(movie.getTitle());
-            if (updatedMovieData.getTitle() != null)
-                movie.setTitle(updatedMovieData.getTitle());
-            if (updatedMovieData.getGenre() != null)
-                movie.setGenre(updatedMovieData.getGenre());
-            if (updatedMovieData.getPlot() != null)
-                movie.setPlot(updatedMovieData.getPlot());
-            if (updatedMovieData.getAwards() != null)
-                movie.setAwards(updatedMovieData.getAwards());
-            if (updatedMovieData.getReleaseYear() != null)
-                movie.setReleaseYear(updatedMovieData.getReleaseYear());
 
-            if (updatedMovieData.getRatings() != null) {
-                for (Rating rating : updatedMovieData.getRatings()) {
-                    rating.setMovie(movie);
-                }
+            movie.setTitle(updatedMovieData.getTitle() != null && !updatedMovieData.getTitle().trim().isEmpty() ? updatedMovieData.getTitle() : movie.getTitle());
+            movie.setGenre(updatedMovieData.getGenre() != null && !updatedMovieData.getGenre().trim().isEmpty() ? updatedMovieData.getGenre() : movie.getGenre());
+            movie.setPlot(updatedMovieData.getPlot() != null && !updatedMovieData.getPlot().trim().isEmpty() ? updatedMovieData.getPlot() : movie.getPlot());
+            movie.setAwards(updatedMovieData.getAwards() != null && !updatedMovieData.getAwards().trim().isEmpty() ? updatedMovieData.getAwards() : movie.getAwards());
+            movie.setReleaseYear(updatedMovieData.getReleaseYear() != null && !updatedMovieData.getReleaseYear().trim().isEmpty() ? updatedMovieData.getReleaseYear() : movie.getReleaseYear());
+
+            if (updatedMovieData.getRatings() != null && !updatedMovieData.getRatings().isEmpty()) {
+                updatedMovieData.getRatings().forEach(rating -> rating.setMovie(movie));
                 movie.getRatings().clear();
                 movie.getRatings().addAll(updatedMovieData.getRatings());
-
             }
 
             movie.setUpdated(true);
             movieRepository.save(movie);
+            return movie;
 
         } else if (omdbMovie != null && deletedMovie.isEmpty()) {
 
@@ -268,37 +271,35 @@ public class OmdbService {
                 throw new NoChangesException("No changes detected for movie with imdbID: " + imdbID);
             }
 
-
             if (omdbMovie.getImdbID() != null) {
                 movie.setImdbID(omdbMovie.getImdbID());
-            } else throw new RuntimeException("Incorrect imdbID to update the movie");
+            }
 
             movie.setUpdated(true);
-
             movie.setPreviousTitle(omdbMovie.getTitle());
 
-            if (updatedMovieData.getTitle() != null && !updatedMovieData.getTitle().isEmpty())
-                movie.setTitle(updatedMovieData.getTitle());
-            if (updatedMovieData.getGenre() != null && !updatedMovieData.getGenre().isEmpty())
-                movie.setGenre(updatedMovieData.getGenre());
-            if (updatedMovieData.getPlot() != null && !updatedMovieData.getPlot().isEmpty())
-                movie.setPlot(updatedMovieData.getPlot());
-            if (updatedMovieData.getAwards() != null && !updatedMovieData.getAwards().isEmpty())
-                movie.setAwards(updatedMovieData.getAwards());
-            if (updatedMovieData.getReleaseYear() != null && !updatedMovieData.getReleaseYear().isEmpty())
-                movie.setReleaseYear(updatedMovieData.getReleaseYear());
+            movie.setTitle(updatedMovieData.getTitle() != null && !updatedMovieData.getTitle().isEmpty() ? updatedMovieData.getTitle() : omdbMovie.getTitle());
+            movie.setGenre(updatedMovieData.getGenre() != null && !updatedMovieData.getGenre().isEmpty() ? updatedMovieData.getGenre() : omdbMovie.getGenre());
+            movie.setPlot(updatedMovieData.getPlot() != null && !updatedMovieData.getPlot().isEmpty() ? updatedMovieData.getPlot() : omdbMovie.getPlot());
+            movie.setAwards(updatedMovieData.getAwards() != null && !updatedMovieData.getAwards().isEmpty() ? updatedMovieData.getAwards() : omdbMovie.getAwards());
+            movie.setReleaseYear(updatedMovieData.getReleaseYear() != null && !updatedMovieData.getReleaseYear().isEmpty() ? updatedMovieData.getReleaseYear() : omdbMovie.getReleaseYear());
 
             if (updatedMovieData.getRatings() != null && !updatedMovieData.getRatings().isEmpty()) {
                 updatedMovieData.getRatings().forEach(rating -> rating.setMovie(movie));
                 movie.setRatings(updatedMovieData.getRatings());
+            } else {
+                movie.setRatings(omdbMovie.getRatings());
             }
-            movieRepository.save(movie);
 
+            movieRepository.save(movie);
+            return movie;
 
         } else {
             throw new MovieNotFoundException("Movie with this imdbID: " + imdbID + " is not found");
         }
     }
+
+
 
     public boolean isNoChange(Movie existingMovie, Movie updatedMovieData) {
         return Objects.equals(existingMovie.getTitle(), updatedMovieData.getTitle()) &&
@@ -334,8 +335,7 @@ public class OmdbService {
 
 
     @Transactional
-    public void createMovie(Movie newMovie){
-
+    public void createMovie(Movie newMovie) throws MovieNotFoundException {
         String url = UriComponentsBuilder.fromHttpUrl(apiUrl)
                 .queryParam("t", URLEncoder.encode(newMovie.getTitle(), StandardCharsets.UTF_8))
                 .queryParam("apikey", apiKey)
@@ -346,49 +346,49 @@ public class OmdbService {
         Optional<Movie> existingTitleInDatabase = movieRepository.findByTitleIgnoreCaseAndIsDeletedFalse(newMovie.getTitle());
         Optional<Movie> deletedMovie = movieRepository.findByTitleIgnoreCaseAndIsDeletedTrue(newMovie.getTitle());
 
-
         if (omdbMovie != null && omdbMovie.getTitle() != null
                 && omdbMovie.getTitle().equalsIgnoreCase(newMovie.getTitle()) || existingTitleInDatabase.isPresent()) {
-            throw new RuntimeException("This movie: " + newMovie.getTitle() + " already exists");
+            throw new MovieAlreadyExistsException("This movie: " + newMovie.getTitle() + " already exists");
         }
 
-
         if (deletedMovie.isPresent()){
-                throw new RuntimeException("This movie: " + newMovie.getTitle() +" is deleted");
+            throw new MovieNotFoundException("This movie: " + newMovie.getTitle() +" is deleted");
+        }
+
+        Movie movie = new Movie();
+
+        if (newMovie.getTitle() != null && !newMovie.getTitle().isEmpty())
+            movie.setTitle(newMovie.getTitle());
+
+        if (newMovie.getPlot() != null && !newMovie.getPlot().isEmpty())
+            movie.setPlot(newMovie.getPlot());
+
+        if (newMovie.getReleaseYear() != null && !newMovie.getReleaseYear().isEmpty())
+            movie.setReleaseYear(newMovie.getReleaseYear());
+
+        if (newMovie.getGenre() != null && !newMovie.getGenre().isEmpty())
+            movie.setGenre(newMovie.getGenre());
+
+        if (newMovie.getAwards() != null && !newMovie.getAwards().isEmpty())
+            movie.setAwards(newMovie.getAwards());
+
+        movie.setImdbID(generateUniqueImdbID());
+        movie.setUpdated(false);
+        movie.setDeleted(false);
+        movie.setPreviousTitle(null);
+
+        if (newMovie.getRatings() != null && !newMovie.getRatings().isEmpty()) {
+            for (Rating rating : newMovie.getRatings()) {
+                rating.setMovie(movie);
             }
+            movie.setRatings(newMovie.getRatings());
+        }
 
-            Movie movie = new Movie();
-
-
-            if (newMovie.getTitle() !=null && !newMovie.getTitle().isEmpty())
-                movie.setTitle(newMovie.getTitle());
-
-            if (newMovie.getPlot() != null && !newMovie.getPlot().isEmpty())
-                movie.setPlot(newMovie.getPlot());
-
-            if (newMovie.getReleaseYear() !=null && !newMovie.getReleaseYear().isEmpty())
-                movie.setReleaseYear(newMovie.getReleaseYear());
-
-            if (newMovie.getGenre() !=null && !newMovie.getGenre().isEmpty())
-                movie.setGenre(newMovie.getGenre());
-
-            if (newMovie.getAwards() !=null && !newMovie.getAwards().isEmpty())
-                movie.setAwards(newMovie.getAwards());
-
-            movie.setImdbID(generateUniqueImdbID());
-            movie.setUpdated(false);
-            movie.setDeleted(false);
-            movie.setPreviousTitle(null);
-
-
-            if (newMovie.getRatings() != null && newMovie.getRatings().isEmpty()) {
-                newMovie.getRatings().forEach(rating -> rating.setMovie(newMovie));
-                movie.setRatings(newMovie.getRatings());
-            }
-            movieRepository.save(movie);
+        movieRepository.save(movie);
 
     }
-        public String generateUniqueImdbID(){
+
+    public String generateUniqueImdbID(){
 
             String imdbID;
             Random random = new Random();
@@ -400,10 +400,15 @@ public class OmdbService {
         }
 
         @Transactional
-        public List<Rating> addRating(String title, List <Rating> ratings) throws MovieNotFoundException {
+        public Movie addRating(String title, List <Rating> ratings) throws MovieNotFoundException {
+
+            if (title == null || title.trim().isEmpty()) {
+                throw new EmptyValueException("Endpoint value cannot be empty");
+            }
 
             Optional<Movie> movieOpt = movieRepository.findByTitleContainingIgnoreCaseAndIsDeletedFalse(title).stream().findFirst();
             Optional<Movie> deletedMovie = movieRepository.findByTitleContainingIgnoreCaseAndIsDeletedTrue(title);
+
 
             if (deletedMovie.isPresent()) {
                 throw new MovieNotFoundException("This movie: " + title + " is deleted");
@@ -419,7 +424,7 @@ public class OmdbService {
                         movie.getRatings().add(rating);
                     }
                     movieRepository.save(movie);
-                    return movie.getRatings();
+                    return movie;
                 }
             }
 
@@ -456,12 +461,17 @@ public class OmdbService {
                 movie.setRatings(ratingList);
                 movieRepository.save(movie);
 
-                return ratingList;
+                return movie;
             }
-            throw new RuntimeException("Movie with this title: " + title + " doesn't exist");
+            throw new MovieNotFoundException("Movie with this title: " + title + " doesn't exist");
         }
 
         public List<Movie> searchMovieByCategory (String query, String category) throws MovieNotFoundException {
+
+
+            if (query.isEmpty() || category.isEmpty()){
+                throw new EmptyValueException("Endpoint values cannot be empty");
+            }
 
             List<Movie> movieList = movieRepository.findByTitleContainingIgnoreCaseAndIsDeletedFalse(query);
 
@@ -508,7 +518,7 @@ public class OmdbService {
         }
 
         @Transactional
-        public void enableMovie (String title) throws MovieNotFoundException {
+        public Movie enableMovie (String title) throws MovieNotFoundException {
 
         Optional<Movie> movieOpt = movieRepository.findByTitleIgnoreCaseAndIsDeletedTrue(title);
         Optional<Movie> enabledMovie = movieRepository.findByTitleIgnoreCaseAndIsDeletedFalse(title);
@@ -517,8 +527,11 @@ public class OmdbService {
             Movie movie = movieOpt.get();
             movie.setDeleted(false);
             movieRepository.save(movie);
-            return;
+            return movie;
         }
+            if (title.isEmpty()){
+                throw new EmptyValueException("Endpoint value cannot be empty");
+            }
 
         if (enabledMovie.isPresent()){
             throw new MovieNotFoundException("Movie with this title: "+ title + " is enable");
@@ -526,4 +539,61 @@ public class OmdbService {
 
         throw new MovieNotFoundException("Movie: "+ title + " doesn't exist");
         }
+
+
+    @Transactional
+    public Movie createMovieFront(Movie newMovie) throws MovieNotFoundException {
+        String url = UriComponentsBuilder.fromHttpUrl(apiUrl)
+                .queryParam("t", URLEncoder.encode(newMovie.getTitle(), StandardCharsets.UTF_8))
+                .queryParam("apikey", apiKey)
+                .toUriString();
+
+        Movie omdbMovie = restTemplate.getForObject(url, Movie.class);
+
+        Optional<Movie> existingTitleInDatabase = movieRepository.findByTitleIgnoreCaseAndIsDeletedFalse(newMovie.getTitle());
+        Optional<Movie> deletedMovie = movieRepository.findByTitleIgnoreCaseAndIsDeletedTrue(newMovie.getTitle());
+
+        if (omdbMovie != null && omdbMovie.getTitle() != null
+                && omdbMovie.getTitle().equalsIgnoreCase(newMovie.getTitle()) || existingTitleInDatabase.isPresent()) {
+            throw new MovieAlreadyExistsException("This movie: " + newMovie.getTitle() + " already exists");
+        }
+
+        if (deletedMovie.isPresent()){
+            throw new MovieNotFoundException("This movie: " + newMovie.getTitle() +" is deleted");
+        }
+
+        Movie movie = new Movie();
+
+        if (newMovie.getTitle() != null && !newMovie.getTitle().isEmpty())
+            movie.setTitle(newMovie.getTitle());
+
+        if (newMovie.getPlot() != null && !newMovie.getPlot().isEmpty())
+            movie.setPlot(newMovie.getPlot());
+
+        if (newMovie.getReleaseYear() != null && !newMovie.getReleaseYear().isEmpty())
+            movie.setReleaseYear(newMovie.getReleaseYear());
+
+        if (newMovie.getGenre() != null && !newMovie.getGenre().isEmpty())
+            movie.setGenre(newMovie.getGenre());
+
+        if (newMovie.getAwards() != null && !newMovie.getAwards().isEmpty())
+            movie.setAwards(newMovie.getAwards());
+
+        movie.setImdbID(generateUniqueImdbID());
+        movie.setUpdated(false);
+        movie.setDeleted(false);
+        movie.setPreviousTitle(null);
+
+        if (newMovie.getRatings() != null && !newMovie.getRatings().isEmpty()) {
+            for (Rating rating : newMovie.getRatings()) {
+                rating.setMovie(movie);
+            }
+            movie.setRatings(newMovie.getRatings());
+        }
+
+        movieRepository.save(movie);
+        return movie;
+    }
+
+
 }

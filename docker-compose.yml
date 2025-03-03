@@ -1,0 +1,28 @@
+services:
+  postgres:
+    container_name: postgres-db
+    image: postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: omdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres:/var/lib/data
+    networks:
+      - project-network
+  spring-boot:
+    container_name: spring-boot-project
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    networks:
+      - project-network
+volumes:
+  postgres:
+networks:
+  project-network:
+    driver: bridge
